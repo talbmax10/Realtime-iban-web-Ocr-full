@@ -1,0 +1,142 @@
+<!DOCTYPE html><html lang="ar">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Realtime IBAN OCR</title>
+<style>
+:root{
+  --bg:#0f1724;
+  --card:#0b1220;
+  --accent:#06b6d4;
+  --muted:#94a3b8;
+  --glass: rgba(255,255,255,0.03);
+}
+body{margin:0;font-family:Inter,Arial,sans-serif;direction:rtl;background:var(--bg);color:#e6eef6;}
+.app{display:flex;flex-direction:row;max-width:1400px;margin:20px auto;gap:12px;}
+.card{background:var(--card);border-radius:12px;padding:12px;box-shadow:0 6px 18px rgba(2,6,23,0.6);}
+.video-section{flex:2;display:flex;flex-direction:column;gap:12px;}
+.results-section{flex:1;display:flex;flex-direction:column;gap:12px;}
+.video-wrap{position:relative;border-radius:10px;overflow:hidden;background:var(--glass);height:420px;}
+video,canvas{width:100%;height:100%;display:block;}
+.controls{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:6px;}
+button{background:linear-gradient(180deg,var(--accent),#018aa3);border:none;color:#021217;padding:6px 10px;border-radius:8px;cursor:pointer;}
+.muted{color:var(--muted);font-size:13px;}
+.result-item{background:rgba(255,255,255,0.02);padding:10px;border-radius:8px;display:flex;flex-direction:column;gap:6px;}
+.iban{font-family:monospace;font-size:18px;font-weight:700;letter-spacing:1px;}
+.crop-preview{width:100%;height:150px;object-fit:contain;border-radius:8px;background:#08121a;}
+.sidebar{position:fixed;top:0;right:-280px;width:260px;height:100%;background:var(--card);padding:12px;transition:0.3s;display:flex;flex-direction:column;gap:10px;}
+.sidebar.open{right:0;}
+.sidebar h2{margin:0;font-size:18px;color:var(--accent);}
+.toggle-sidebar{position:fixed;top:12px;right:12px;z-index:1000;}
+textarea{width:100%;border-radius:6px;padding:6px;background:#0b1220;color:#e6eef6;border:none;resize:none;}
+input[type=range]{width:100%;}
+.log-item{font-size:13px;color:var(--muted);}
+</style>
+</head>
+<body>
+<div class="toggle-sidebar"><button id="sidebarBtn">⚙️ الإعدادات</button></div>
+<div class="sidebar" id="sidebar">
+  <h2>الإعدادات</h2>
+  <label>اختر الكاميرا</label>
+  <select id="cameraSelect"></select>
+  <label>دقة الفيديو</label>
+  <select id="videoRes">
+    <option value="320">منخفض</option>
+    <option value="640" selected>متوسط</option>
+    <option value="1280">عالي</option>
+  </select>
+  <label>لون المربع</label>
+  <input type="color" id="rectColor" value="#06b6d4">
+  <label>تحسين التباين</label>
+  <input type="checkbox" id="enhanceContrast" checked>
+</div>
+<div class="app">
+  <div class="video-section card">
+    <div class="video-wrap">
+      <video id="video" autoplay playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div class="controls">
+      <button id="btnStart">تشغيل الكاميرا</button>
+      <button id="btnStop" disabled>إيقاف</button>
+      <div class="muted">FPS:</div>
+      <input id="fpsRange" type="range" min="1" max="10" value="4">
+    </div>
+    <div class="muted" id="status">متوقف</div>
+  </div>
+  <div class="results-section">
+    <div class="result-item">
+      <div>أحدث رمز IBAN مكتشف:</div>
+      <div id="detectedIban" class="iban">—</div>
+      <button id="validateBtn" disabled>تدقيق IBAN</button>
+      <div id="ibanCheck" class="muted">لم يتم التدقيق</div>
+    </div>
+    <div class="result-item">
+      <div>معاينة صورة المنطقة المكتشفة:</div>
+      <canvas id="cropCanvas" class="crop-preview"></canvas>
+    </div>
+    <div class="result-item">
+      <div>سجل المسوحات:</div>
+      <div id="log" id="log" style="max-height:200px;overflow:auto;"></div>
+    </div>
+  </div>
+</div>
+<script src="https://unpkg.com/tesseract.js@2.1.5/dist/tesseract.min.js"></script>
+<script>
+const video=document.getElementById('video');
+const overlay=document.getElementById('overlay');
+const cropCanvas=document.getElementById('cropCanvas');
+const btnStart=document.getElementById('btnStart');
+const btnStop=document.getElementById('btnStop');
+const statusEl=document.getElementById('status');
+const detectedIbanEl=document.getElementById('detectedIban');
+const validateBtn=document.getElementById('validateBtn');
+const ibanCheck=document.getElementById('ibanCheck');
+const logEl=document.getElementById('log');
+const fpsRange=document.getElementById('fpsRange');
+const sidebarBtn=document.getElementById('sidebarBtn');
+const sidebar=document.getElementById('sidebar');
+const cameraSelect=document.getElementById('cameraSelect');
+let stream=null,worker=null,running=false,intervalId=null,roi=null;
+const IBAN_REGEX=/\b([A-Z]{2}[0-9]{2}[A-Z0-9]{10,30})\b/i;
+let scanLog=[];
+sidebarBtn.addEventListener('click',()=>{sidebar.classList.toggle('open');});
+async function initWorker(){if(worker)return;status('تحميل OCR...');worker=Tesseract.createWorker();await worker.load();await worker.loadLanguage('eng');await worker.initialize('eng');status('جاهز للتعرف');}
+function status(text){statusEl.textContent=text;}
+btnStart.addEventListener('click',async()=>{
+  try{
+    await initWorker();
+    await getCameras();
+    const camId=cameraSelect.value||undefined;
+    const res=parseInt(document.getElementById('videoRes').value);
+    stream=await navigator.mediaDevices.getUserMedia({video:{deviceId:camId?{exact:camId}:undefined,width:res,height:res},audio:false});
+    video.srcObject=stream;await video.play();
+    overlay.width=video.videoWidth;overlay.height=video.videoHeight;
+    cropCanvas.width=400;cropCanvas.height=150;
+    running=true;btnStart.disabled=true;btnStop.disabled=false;
+    startProcessing();status('يعمل — بدأ المسح');
+  }catch(err){console.error(err);status('خطأ: '+err.message);}
+});
+btnStop.addEventListener('click',()=>{running=false;btnStart.disabled=false;btnStop.disabled=true;status('متوقف');if(stream)stream.getTracks().forEach(t=>t.stop());if(intervalId)clearInterval(intervalId);});
+async function getCameras(){const devices=await navigator.mediaDevices.enumerateDevices();cameraSelect.innerHTML='';devices.filter(d=>d.kind==='videoinput').forEach(d=>{const opt=document.createElement('option');opt.value=d.deviceId;opt.text=d.label||`Camera ${cameraSelect.length+1}`;cameraSelect.appendChild(opt);});}
+function log(msg){const d=new Date().toLocaleTimeString();const entry=document.createElement('div');entry.className='log-item';entry.innerHTML=`[${d}] ${msg}<br><textarea placeholder='ملاحظة'></textarea>`;logEl.prepend(entry);scanLog.push(entry);}
+function ibanValidate(ibanRaw){if(!ibanRaw)return false;let iban=ibanRaw.replace(/\s+/g,'').toUpperCase();iban=iban.slice(4)+iban.slice(0,4);let expanded='';for(let ch of iban){let code=ch.charCodeAt(0);if(ch>='A'&&ch<='Z')expanded+=code-55;else expanded+=ch;}let remainder=0;for(let i=0;i<expanded.length;i+=7){let part=remainder+expanded.substr(i,7);remainder=parseInt(part,10)%97;}return remainder===1;}
+validateBtn.addEventListener('click',()=>{const text=detectedIbanEl.textContent.replace(/\s+/g,'');if(!text||text==='—')return;ibanCheck.textContent=ibanValidate(text)?'صالح ✅':'غير صالح ❌';});
+function formatIban(iban){return iban.replace(/(.{4})/g,'$1 ').trim();}
+function startProcessing(){const fps=()=>parseInt(fpsRange.value,10);intervalId=setInterval(async()=>{
+if(!running)return;
+try{
+const tmp=document.createElement('canvas');tmp.width=video.videoWidth;tmp.height=video.videoHeight;const tctx=tmp.getContext('2d');tctx.drawImage(video,0,0,tmp.width,tmp.height);
+const cropBox={x:0,y:0,w:tmp.width,h:tmp.height};
+const cropCanvasLocal=document.createElement('canvas');cropCanvasLocal.width=cropBox.w;cropCanvasLocal.height=cropBox.h;
+cropCanvasLocal.getContext('2d').drawImage(tmp,cropBox.x,cropBox.y,cropBox.w,cropBox.h,0,0,cropBox.w,cropBox.h);
+const {data}=await worker.recognize(cropCanvasLocal);
+const words=data.words||[];
+for(let w of words){const t=w.text.replace(/[\s\u00A0\-]+/g,'');if(IBAN_REGEX.test(t)){const ibanNorm=t.toUpperCase();detectedIbanEl.textContent=formatIban(ibanNorm);ibanCheck.textContent='لم يتم التدقيق';drawCropPreview(cropCanvasLocal,w.bbox);log(ibanNorm);break;}}
+status('جاهز');
+}catch(e){console.error(e);status('خطأ في المعالجة');}
+},1000/fps());}
+function drawCropPreview(source,box){const ctx=cropCanvas.getContext('2d');ctx.clearRect(0,0,cropCanvas.width,cropCanvas.height);ctx.drawImage(source,box.x,box.y,box.w,box.h,0,0,cropCanvas.width,cropCanvas.height);}
+</script>
+</body>
+</html>
